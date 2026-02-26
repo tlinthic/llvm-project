@@ -2360,7 +2360,7 @@ bool RewriteMFMAFormStage::initHeuristics(
         // For any user of the result of the MFMA which is not an MFMA, we
         // insert a copy. For a given register, we will only insert one copy
         // per user block.
-        CopyForUse[RUOp->getParent()->getParent()].insert(RUOp);
+        CopyForUse[RUOp->getParent()->getParent()].push_back(RUOp);
 
         SmallVector<SlotIndex, 8> DstUsesReachingDefs;
         findReachingDefs(*RUOp, DAG.LIS, DstUsesReachingDefs);
@@ -2398,13 +2398,14 @@ bool RewriteMFMAFormStage::initHeuristics(
 }
 
 int64_t RewriteMFMAFormStage::getCopyCost(const TargetRegisterClass *BaseRC,
-                                          MachineOperand *MO) {
-  unsigned SubRegIndex = MO.getSubReg();
-  if (!SubRegIndex)
+                                          MachineOperand *MO) const {
+  assert(MO->isReg());
+  unsigned SubRegIdx = MO->getSubReg();
+  if (!SubRegIdx)
     return BaseRC->getCopyCost();
 
   const TargetRegisterClass *SubRC =
-    TRI->getSubClassWithSubReg(BaseRC, SubRegIdx);
+    DAG.TRI->getSubClassWithSubReg(BaseRC, SubRegIdx);
   return SubRC->getCopyCost();
 }
 
@@ -2491,11 +2492,11 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
   }
 
   // Account for CopyForUse copies in each block that the register is used.
-  for (auto &[UseBlock, UseRegs] : CopyForUse) {
+  for (auto &[UseBlock, UseOpers] : CopyForUse) {
     uint64_t UseFreq =
         EntryFreq ? MBFI->getBlockFreq(UseBlock).getFrequency() / EntryFreq : 1;
 
-    for (MachineOperand *UseReg : UseRegs) {
+    for (MachineOperand *UseMO : UseOpers) {
       Register UseReg = UseMO->getReg();
       const TargetRegisterClass *BaseRC = DAG.MRI.getRegClass(UseReg);
       CopyCost += getCopyCost(BaseRC, UseMO) * UseFreq;
@@ -2564,7 +2565,8 @@ bool RewriteMFMAFormStage::rewrite(
   DenseSet<Register> RewriteRegs;
   // The map of an original register in the MFMA to a new register (result of a
   // copy) that it should be replaced with.
-  DenseMap<Register, Register> RedefMap;
+  using RegSubRegPair = std::pair<Register, unsigned>;
+  DenseMap<RegSubRegPair, Register> RedefMap;
   // The map of the original MFMA registers to the relevant MFMA operands.
   DenseMap<Register, DenseSet<MachineOperand *>> ReplaceMap;
   // The map of reaching defs for a given register -- to avoid duplicate copies.
@@ -2582,6 +2584,7 @@ bool RewriteMFMAFormStage::rewrite(
 
     // Case 1: insert copies for the reaching defs of the Src2Reg.
     MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
+    unsigned Src2SubIdx = Src2->getSubReg();
     if (Src2->isReg()) {
       Register Src2Reg = Src2->getReg();
       if (!Src2Reg.isVirtual())
@@ -2602,18 +2605,20 @@ bool RewriteMFMAFormStage::rewrite(
       }
 
       if (!Src2DefsReplace.empty()) {
-        DenseMap<Register, Register>::iterator RI = RedefMap.find(Src2Reg);
+        RegSubRegPair Src2Pair(Src2Reg, Src2SubIdx);
+        DenseMap<Register, Register>::iterator RI = RedefMap.find(Src2Pair);
         if (RI != RedefMap.end()) {
-          MappedReg = RI->second;
+          MappedReg = RI->second.first;
         } else {
           assert(!ReachingDefCopyMap.contains(Src2Reg));
           const TargetRegisterClass *Src2RC = DAG.MRI.getRegClass(Src2Reg);
+          Src2RC = DAG.TRI->getSubRegisterClass(Src2Reg, Src2SubIdx);
           const TargetRegisterClass *VGPRRC =
               SRI->getEquivalentVGPRClass(Src2RC);
 
           // Track the mapping of the original register to the new register.
           MappedReg = DAG.MRI.createVirtualRegister(VGPRRC);
-          RedefMap[Src2Reg] = MappedReg;
+          RedefMap[Src2Pair] = MappedReg;
         }
 
         // If none exists, create a copy from this reaching def.
@@ -2621,12 +2626,11 @@ bool RewriteMFMAFormStage::rewrite(
         for (MachineInstr *RD : Src2DefsReplace) {
           // Do not create redundant copies.
           if (ReachingDefCopyMap[Src2Reg].insert(RD).second) {
-            unsigned SubIdx = Src2->getSubReg();
             MachineInstrBuilder VGPRCopy =
                 BuildMI(*RD->getParent(), std::next(RD->getIterator()),
                         RD->getDebugLoc(), TII->get(TargetOpcode::COPY))
-                    .addDef(MappedReg, {}, SubIdx)
-                    .addUse(Src2Reg, {}, SubIdx);
+                    .addDef(MappedReg, {}, 0)
+                    .addUse(Src2Reg, {}, Src2SubIdx);
             DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
 
             // If this reaching def was the last MI in the region, update the
@@ -2655,12 +2659,14 @@ bool RewriteMFMAFormStage::rewrite(
     Register DstReg = Dst->getReg();
     if (!DstReg.isVirtual())
       return false;
+    const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
 
     Register MappedReg = DstReg;
     SmallVector<MachineOperand *, 8> DstReachingUses;
 
     SmallVector<MachineOperand *, 8> DstReachingUseCopies;
-    SmallVector<MachineInstr *, 8> DstUseDefsReplace;
+    using DstUseDefPair = std::pair<MachineInstr *, unsigned>;
+    SmallVector<DstUseDefPair, 8> DstUseDefsReplace;
 
     findReachingUses(MI, DAG.LIS, DstReachingUses);
 
@@ -2681,35 +2687,40 @@ bool RewriteMFMAFormStage::rewrite(
 
         // If there is a non mai reaching def of this reaching use, then we will
         // need a copy.
-        if (find(DstUseDefsReplace, RD) == DstUseDefsReplace.end())
-          DstUseDefsReplace.push_back(RD);
+        unsigned SubIdx = RUOp->getSubReg();
+        DstUseDefPair DUDPair(RD, SubIdx);
+        if (find(DstUseDefsReplace, DUDPair) ==
+            DstUseDefsReplace.end())
+          DstUseDefsReplace.push_back(DUDPair);
       }
     }
 
     if (!DstUseDefsReplace.empty()) {
-      DenseMap<Register, Register>::iterator RI = RedefMap.find(DstReg);
-      if (RI != RedefMap.end()) {
-        MappedReg = RI->second;
-      } else {
-        assert(!ReachingDefCopyMap.contains(DstReg));
-        const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
-        const TargetRegisterClass *VGPRRC = SRI->getEquivalentVGPRClass(DstRC);
-
-        // Track the mapping of the original register to the new register.
-        MappedReg = DAG.MRI.createVirtualRegister(VGPRRC);
-        RedefMap[DstReg] = MappedReg;
-      }
-
       // If none exists, create a copy from this reaching def.
       // We may have inserted a copy already in an earlier iteration.
-      for (MachineInstr *RD : DstUseDefsReplace) {
+      for (auto [RD, SubIdx] : DstUseDefsReplace) {
+        RegSubRegPair DefPair(DstReg, SubIdx);
+        DenseMap<Register, RegSubRegPair>::iterator RI = RedefMap.find(DstPair);
+        if (RI != RedefMap.end()) {
+          MappedReg = RI->second;
+        } else {
+          assert(!ReachingDefCopyMap.contains(DstReg));
+          const TargetRegisterClass *DestSubRegRC =
+              DAG.TRI->getSubRegisterClass(DestRC, SubIdx);
+          const TargetRegisterClass *VGPRRC =
+              SRI->getEquivalentVGPRClass(DstSubRegRC);
+
+          // Track the mapping of the original register to the new register.
+          MappedReg = DAG.MRI.createVirtualRegister(VGPRRC);
+          RedefMap[DefPair] = MappedReg;
+        }
+
         // Do not create reundant copies.
         if (ReachingDefCopyMap[DstReg].insert(RD).second) {
-          unsigned SubIdx = RUOp->getSubReg();
           MachineInstrBuilder VGPRCopy =
               BuildMI(*RD->getParent(), std::next(RD->getIterator()),
                       RD->getDebugLoc(), TII->get(TargetOpcode::COPY))
-                  .addDef(MappedReg, {}, SubIdx)
+                  .addDef(MappedReg, {}, 0)
                   .addUse(DstReg, {}, SubIdx);
           DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
 
@@ -2738,15 +2749,17 @@ bool RewriteMFMAFormStage::rewrite(
 
       // Special case, the use is in the same block as the MFMA. Insert the copy
       // just before the use.
-      const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
-      const TargetRegisterClass *VGPRRC = SRI->getEquivalentVGPRClass(DstRC);
+      const TargetRegisterClass *DestSubRegRC =
+          DAG.TRI->getSubRegisterClass(DestRC, SubIdx);
+      const TargetRegisterClass *VGPRRC =
+          SRI->getEquivalentVGPRClass(DstSubRegRC);
       Register NewUseReg = DAG.MRI.createVirtualRegister(VGPRRC);
       MachineInstr *UseInst = RU->getParent();
       unsigned SubIdx = RU->getSubReg();
       MachineInstrBuilder VGPRCopy =
           BuildMI(*UseInst->getParent(), UseInst->getIterator(),
                   UseInst->getDebugLoc(), TII->get(TargetOpcode::COPY))
-              .addDef(NewUseReg, {}, SubIdx)
+              .addDef(NewUseReg, {}, 0)
               .addUse(DstReg, {}, SubIdx);
       DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
       // Since we know this use has only one reaching def, we can replace the
@@ -2781,49 +2794,66 @@ bool RewriteMFMAFormStage::rewrite(
           InstPt = NewInstPt;
       }
 
-      const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(RUDst.first);
-      const TargetRegisterClass *VGPRRC = SRI->getEquivalentVGPRClass(DstRC);
-      Register NewUseReg = DAG.MRI.createVirtualRegister(VGPRRC);
-      MachineInstr *UseInst = DAG.LIS->getInstructionFromIndex(InstPt);
-
-      unsigned SubIdx = RUDst.getSubReg();
-      MachineInstrBuilder VGPRCopy =
-          BuildMI(*UseInst->getParent(), UseInst->getIterator(),
-                  UseInst->getDebugLoc(), TII->get(TargetOpcode::COPY))
-              .addDef(NewUseReg, {}, SubIdx)
-              .addUse(RUDst.first, {}, SubIdx);
-      DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
-
-      // If this UseInst was the first MI in the region, update the region
-      // boundaries.
-      DenseMap<MachineInstr *, unsigned>::iterator FI =
-          FirstMIToRegion.find(UseInst);
-      if (FI != FirstMIToRegion.end()) {
-        unsigned UpdateRegion = FI->second;
-        DAG.Regions[UpdateRegion].first = VGPRCopy;
-        FirstMIToRegion.erase(UseInst);
-      }
-
-      // Replace the operand for all users.
+      LaneBitmask CopiedRegMask;
       for (MachineOperand *User : RUDst.second) {
-        User->setReg(NewUseReg);
-      }
+        unsigned SubIdx = User->getSubReg();
+        LaneBitmask SubRegMask = DAG.TRI->getSubRegIndexLaneMask(SubIdx);
 
-      // Track the copy source operand for replacement.
-      ReplaceMap[RUDst.first].insert(&VGPRCopy->getOperand(1));
+        // Skip if this subreg has been copied.
+        if ((SubRegMask & CopiedRegMask) == SubRegMask)
+          continue;
+        CopiedRegMask |= SubRegMask;
+
+        const TargetRegisterClass *DstBaseRC = DAG.MRI.getRegClass(RUDst.first);
+        const TargetRegisterClass *DestSubRegRC =
+            DAG.TRI->getSubRegisterClass(DestBaseRC, SubIdx);
+        const TargetRegisterClass *VGPRRC =
+            SRI->getEquivalentVGPRClass(DstSubRegRC);
+        Register NewUseReg = DAG.MRI.createVirtualRegister(VGPRRC);
+        MachineInstr *UseInst = DAG.LIS->getInstructionFromIndex(InstPt);
+
+        MachineInstrBuilder VGPRCopy =
+            BuildMI(*UseInst->getParent(), UseInst->getIterator(),
+                    UseInst->getDebugLoc(), TII->get(TargetOpcode::COPY))
+                .addDef(NewUseReg, {}, 0)
+                .addUse(RUDst.first, {}, SubIdx);
+        DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
+
+        // If this UseInst was the first MI in the region, update the region
+        // boundaries.
+        DenseMap<MachineInstr *, unsigned>::iterator FI =
+            FirstMIToRegion.find(UseInst);
+        if (FI != FirstMIToRegion.end()) {
+          unsigned UpdateRegion = FI->second;
+          DAG.Regions[UpdateRegion].first = VGPRCopy;
+          FirstMIToRegion.erase(UseInst);
+        }
+
+        // Replace the operand for all users.
+        for (MachineOperand *User : RUDst.second) {
+          User->setReg(NewUseReg);
+          User->setSubReg(SubIdx);
+        }
+
+        // Track the copy source operand for replacement.
+        ReplaceMap[RUDst.first].insert(&VGPRCopy->getOperand(1));
+      }
     }
   }
 
   // We may have needed to insert copies after the reaching defs of the MFMAs.
   // Replace the original register with the result of the copy for all relevant
   // operands.
-  for (std::pair<Register, Register> NewDef : RedefMap) {
-    Register OldReg = NewDef.first;
+  for (std::pair<RegSubRegPair, Register> NewDef : RedefMap) {
+    Register OldReg = NewDef.first.first;
     Register NewReg = NewDef.second;
+    unsigned SubIdx = NewDef.first.second;
 
     // Replace the register for any associated operand in the MFMA chain.
-    for (MachineOperand *ReplaceOp : ReplaceMap[OldReg])
+    for (MachineOperand *ReplaceOp : ReplaceMap[OldReg]) {
       ReplaceOp->setReg(NewReg);
+      ReplaceOp->setSubReg(SubIdx);
+    }
   }
 
   // Finally, do the reclassification of the MFMA registers.

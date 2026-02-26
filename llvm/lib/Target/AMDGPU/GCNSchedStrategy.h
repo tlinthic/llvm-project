@@ -453,10 +453,14 @@ private:
   /// for the rewrite. Stores the rewritten instructions in \p RewriteCands ,
   /// the copy locations for uses (of the MFMA result) in \p CopyForUse and the
   /// copy locations for defs (of the MFMA operands) in \p CopyForDef
-  bool
-  initHeuristics(std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
-                 DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
-                 SmallPtrSetImpl<MachineInstr *> &CopyForDef);
+  bool initHeuristics(
+      std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
+      DenseMap<MachineBasicBlock *, SmallVector<MachineOperand *>> &CopyForUse,
+      SmallPtrSetImpl<MachineInstr *> &CopyForDef);
+
+  /// Calculate the copy cost of a register from a MachineOperand.
+  int64_t getCopyCost(const TargetRegisterClass *BaseRC,
+                      MachineOperand *MO) const;
 
   /// Check if partial subreg writes to this register are safe to convert to
   /// AGPR.  Returns false if there are unsafe partial redef patterns.
@@ -470,7 +474,8 @@ private:
   /// costs, and \p RewriteCands to undo rewriting.
   int64_t getRewriteCost(
       const std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
-      const DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
+      const DenseMap<MachineBasicBlock *, SmallVector<MachineOperand *>>
+          &CopyForUse,
       const SmallPtrSetImpl<MachineInstr *> &CopyForDef);
 
   /// Do the final rewrite on \p RewriteCands and insert any needed copies.

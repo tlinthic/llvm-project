@@ -2562,10 +2562,10 @@ bool RewriteMFMAFormStage::rewrite(
   // up creating illegal instructions.
 
   // The original registers of the MFMA that need to be reclassified as AGPR.
-  DenseSet<Register> RewriteRegs;
+  using RegSubRegPair = std::pair<Register, unsigned>;
+  DenseSet<RegSubRegPair> RewriteRegs;
   // The map of an original register in the MFMA to a new register (result of a
   // copy) that it should be replaced with.
-  using RegSubRegPair = std::pair<Register, unsigned>;
   DenseMap<RegSubRegPair, Register> RedefMap;
   // The map of the original MFMA registers to the relevant MFMA operands.
   DenseMap<Register, DenseSet<MachineOperand *>> ReplaceMap;
@@ -2584,8 +2584,8 @@ bool RewriteMFMAFormStage::rewrite(
 
     // Case 1: insert copies for the reaching defs of the Src2Reg.
     MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
-    unsigned Src2SubIdx = Src2->getSubReg();
     if (Src2->isReg()) {
+      unsigned Src2SubIdx = Src2->getSubReg();
       Register Src2Reg = Src2->getReg();
       if (!Src2Reg.isVirtual())
         return false;
@@ -2646,7 +2646,7 @@ bool RewriteMFMAFormStage::rewrite(
       }
 
       // Track the register for reclassification
-      RewriteRegs.insert(Src2Reg);
+      RewriteRegs.insert(RegSubRegPair(Src2Reg, Src2SubIdx));
 
       // Always insert the operand for replacement. If this corresponds with a
       // chain of tied-def we may not see the VGPR requirement until later.
@@ -2660,7 +2660,6 @@ bool RewriteMFMAFormStage::rewrite(
     Register DstReg = Dst->getReg();
     if (!DstReg.isVirtual())
       return false;
-    const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
 
     Register MappedReg = DstReg;
     SmallVector<MachineOperand *, 8> DstReachingUses;
@@ -2706,6 +2705,7 @@ bool RewriteMFMAFormStage::rewrite(
           MappedReg = RI->second;
         } else {
           assert(!ReachingDefCopyMap.contains(DstPair));
+          const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
           const TargetRegisterClass *DstSubRegRC =
               DAG.TRI->getSubRegisterClass(DstRC, SubIdx);
           const TargetRegisterClass *VGPRRC =
@@ -2751,6 +2751,7 @@ bool RewriteMFMAFormStage::rewrite(
       // Special case, the use is in the same block as the MFMA. Insert the copy
       // just before the use.
       unsigned SubIdx = RU->getSubReg();
+      const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
       const TargetRegisterClass *DstSubRegRC =
           DAG.TRI->getSubRegisterClass(DstRC, SubIdx);
       const TargetRegisterClass *VGPRRC =
@@ -2764,14 +2765,16 @@ bool RewriteMFMAFormStage::rewrite(
               .addUse(DstReg, {}, SubIdx);
       DAG.LIS->InsertMachineInstrInMaps(*VGPRCopy);
       // Since we know this use has only one reaching def, we can replace the
-      // use reg.
+      // use reg. We reset subReg to 0 since the register created for the copy
+      // is of the size of the subReg.
       RU->setReg(NewUseReg);
+      RU->setSubReg(0);
       // Track the copy source operand for r eplacement.
       DstRegSet.insert(&VGPRCopy->getOperand(1));
     }
 
     // Track the register for reclassification
-    RewriteRegs.insert(DstReg);
+    RewriteRegs.insert(RegSubRegPair(DstReg, 0));
 
     // Insert the dst operand for replacement. If this dst is in a chain of
     // tied-def MFMAs, and the first src2 needs to be replaced with a new reg,
@@ -2795,16 +2798,8 @@ bool RewriteMFMAFormStage::rewrite(
           InstPt = NewInstPt;
       }
 
-      LaneBitmask CopiedRegMask;
       for (MachineOperand *User : RUDst.second) {
         unsigned SubIdx = User->getSubReg();
-        LaneBitmask SubRegMask = DAG.TRI->getSubRegIndexLaneMask(SubIdx);
-
-        // Skip if this subreg has been copied.
-        if ((SubRegMask & CopiedRegMask) == SubRegMask)
-          continue;
-        CopiedRegMask |= SubRegMask;
-
         const TargetRegisterClass *DstBaseRC = DAG.MRI.getRegClass(RUDst.first);
         const TargetRegisterClass *DstSubRegRC =
             DAG.TRI->getSubRegisterClass(DstBaseRC, SubIdx);
@@ -2830,10 +2825,11 @@ bool RewriteMFMAFormStage::rewrite(
           FirstMIToRegion.erase(UseInst);
         }
 
-        // Replace the operand for all users.
+        // Replace the operand for all users. We reset subReg to 0 since the
+        // register created for the copy is of the size of the subReg.
         for (MachineOperand *User : RUDst.second) {
           User->setReg(NewUseReg);
-          User->setSubReg(SubIdx);
+          User->setSubReg(0);
         }
 
         // Track the copy source operand for replacement.
@@ -2850,13 +2846,32 @@ bool RewriteMFMAFormStage::rewrite(
     Register NewReg = NewDef.second;
     unsigned SubIdx = NewDef.first.second;
 
-    // Replace the register for any associated operand in the MFMA chain.
+    // Replace the register for any associated operand in the MFMA chain.  We
+    // reset subReg to 0 since the register created for the copy is of the size
+    // of the subReg.
     for (MachineOperand *ReplaceOp : ReplaceMap[OldReg]) {
       ReplaceOp->setReg(NewReg);
-      ReplaceOp->setSubReg(SubIdx);
+      ReplaceOp->setSubReg(0);
     }
   }
 
+  // Finally, do the reclassification of the MFMA registers.
+  for (RegSubRegPair RewriteReg : RewriteRegs) {
+    Register RegToRewrite = RewriteReg.first;
+    unsigned SubIdx = RewriteReg.second;
+
+    // Be sure to update the replacement register and not the original.
+    DenseMap<RegSubRegPair, Register>::iterator RI = RedefMap.find(RewriteReg);
+    if (RI != RedefMap.end())
+      RegToRewrite = RI->second;
+
+    const TargetRegisterClass *BaseRC = DAG.MRI.getRegClass(RegToRewrite);
+    const TargetRegisterClass *CurrRC =
+        DAG.TRI->getSubRegisterClass(BaseRC, SubIdx);
+    const TargetRegisterClass *AGPRRC = SRI->getEquivalentAGPRClass(CurrRC);
+
+    DAG.MRI.setRegClass(RegToRewrite, AGPRRC);
+  }
 
   // Bulk update the LIS.
   DAG.LIS->reanalyze(DAG.MF);

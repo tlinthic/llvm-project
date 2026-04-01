@@ -100,7 +100,7 @@ static cl::opt<bool> PrintMaxRPRegUsageAfterScheduler(
 
 static cl::opt<bool> DisableRewriteMFMAFormSchedStage(
     "amdgpu-disable-rewrite-mfma-form-sched-stage", cl::Hidden,
-    cl::desc("Disable rewrite mfma rewrite scheduling stage"), cl::init(true));
+    cl::desc("Disable rewrite mfma rewrite scheduling stage"), cl::init(false));
 
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
@@ -2257,6 +2257,81 @@ bool RewriteMFMAFormStage::isRewriteCandidate(MachineInstr *MI) const {
   return AMDGPU::getMFMASrcCVDstAGPROp(MI->getOpcode()) != -1;
 }
 
+void RewriteMFMAFormStage::revertRewrite(
+    const std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands) {
+  // Reset the classes that were changed to AGPR for better RP analysis.
+  // We must do rewriting after copy-insertion, as some defs of the register
+  // may require VGPR.  Additionally, if we bail out and don't perform the
+  // rewrite then these need to be restored anyway.
+  for (auto &[MI, OriginalOpcode] : RewriteCands) {
+    assert(TII->isMAI(*MI));
+    const TargetRegisterClass *ADefRC =
+        DAG.MRI.getRegClass(MI->getOperand(0).getReg());
+    const TargetRegisterClass *VDefRC = SRI->getEquivalentVGPRClass(ADefRC);
+    DAG.MRI.setRegClass(MI->getOperand(0).getReg(), VDefRC);
+    MI->setDesc(TII->get(OriginalOpcode));
+
+    MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
+    assert(Src2);
+    if (!Src2->isReg())
+      continue;
+
+    // Have to get src types separately since subregs may cause C and D
+    // registers to be different types even though the actual operand is
+    // the same size.
+    const TargetRegisterClass *AUseRC = DAG.MRI.getRegClass(Src2->getReg());
+    const TargetRegisterClass *VUseRC = SRI->getEquivalentVGPRClass(AUseRC);
+    DAG.MRI.setRegClass(Src2->getReg(), VUseRC);
+  }
+}
+
+bool RewriteMFMAFormStage::hasSafePartialRedefs(Register Reg) {
+  LiveInterval &LI = DAG.LIS->getInterval(Reg);
+
+  // Iterate through all segments in the live interval
+  for (auto &Seg : LI) {
+    VNInfo *VNI = Seg.valno;
+
+    // Skip PHI defs
+    if (VNI->isPHIDef())
+      continue;
+
+    MachineInstr *DefMI = DAG.LIS->getInstructionFromIndex(VNI->def);
+    if (!DefMI)
+      continue;
+
+    // Check for inline asm or special instructions.
+    if (DefMI->getNumOperands() == 0 || !DefMI->getOperand(0).isReg())
+      return false;
+
+    MachineOperand &DefMO = DefMI->getOperand(0);
+
+    // Check if this is a partial subreg write and if it merges with a
+    // previous mfma definition (i.e. overwrites some of it's subregs)
+    // as rewrite won't properly generate copies for it.
+    if (DefMO.getReg() == Reg && DefMO.getSubReg() != 0) {
+      // Find what value is being merged with (the previous segment).
+      VNInfo *PrevVNI = LI.getVNInfoBefore(VNI->def);
+      if (!PrevVNI)
+        continue; // No previous value, this is initialization
+
+      // Conservatively reject if it's a PHI definition.
+      if (PrevVNI->isPHIDef()) {
+        return false;
+      }
+
+      MachineInstr *PrevDefMI = DAG.LIS->getInstructionFromIndex(PrevVNI->def);
+      if (!PrevDefMI)
+        continue;
+
+      if (TII->isMAI(*PrevDefMI) && !TII->isMAI(*DefMI))
+        return false;
+    }
+  }
+
+  return true;
+}
+
 bool RewriteMFMAFormStage::initHeuristics(
     std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
     DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
@@ -2269,14 +2344,24 @@ bool RewriteMFMAFormStage::initHeuristics(
       if (!isRewriteCandidate(&MI))
         continue;
 
+      MachineOperand &Dst = MI.getOperand(0);
       int ReplacementOp = AMDGPU::getMFMASrcCVDstAGPROp(MI.getOpcode());
       assert(ReplacementOp != -1);
+      if (Dst.isReg() && !hasSafePartialRedefs(Dst.getReg())) {
+        revertRewrite(RewriteCands);
+        return false;
+      }
 
       RewriteCands.push_back({&MI, MI.getOpcode()});
       MI.setDesc(TII->get(ReplacementOp));
 
       MachineOperand *Src2 = TII->getNamedOperand(MI, AMDGPU::OpName::src2);
       if (Src2->isReg()) {
+        if (!hasSafePartialRedefs(Src2->getReg())) {
+          revertRewrite(RewriteCands);
+          return false;
+        }
+
         SmallVector<SlotIndex, 8> Src2ReachingDefs;
         findReachingDefs(*Src2, DAG.LIS, Src2ReachingDefs);
 
@@ -2289,7 +2374,6 @@ bool RewriteMFMAFormStage::initHeuristics(
         }
       }
 
-      MachineOperand &Dst = MI.getOperand(0);
       SmallVector<MachineOperand *, 8> DstReachingUses;
 
       findReachingUses(&MI, DAG.LIS, DstReachingUses);
@@ -2429,30 +2513,7 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
     }
   }
 
-  // Reset the classes that were changed to AGPR for better RB analysis.
-  // We must do rewriting after copy-insertion, as some defs of the register
-  // may require VGPR.  Additionally, if we bail out and don't perform the
-  // rewrite then these need to be restored anyway.
-  for (auto &[MI, OriginalOpcode] : RewriteCands) {
-    assert(TII->isMAI(*MI));
-    const TargetRegisterClass *ADefRC =
-        DAG.MRI.getRegClass(MI->getOperand(0).getReg());
-    const TargetRegisterClass *VDefRC = SRI->getEquivalentVGPRClass(ADefRC);
-    DAG.MRI.setRegClass(MI->getOperand(0).getReg(), VDefRC);
-    MI->setDesc(TII->get(OriginalOpcode));
-
-    MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
-    assert(Src2);
-    if (!Src2->isReg())
-      continue;
-
-    // Have to get src types separately since subregs may cause C and D
-    // registers to be different types even though the actual operand is
-    // the same size.
-    const TargetRegisterClass *AUseRC = DAG.MRI.getRegClass(Src2->getReg());
-    const TargetRegisterClass *VUseRC = SRI->getEquivalentVGPRClass(AUseRC);
-    DAG.MRI.setRegClass(Src2->getReg(), VUseRC);
-  }
+  revertRewrite(RewriteCands);
 
   return Cost + CopyCost;
 }

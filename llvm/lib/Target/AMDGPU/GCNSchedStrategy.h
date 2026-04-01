@@ -455,6 +455,13 @@ private:
                  DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
                  SmallPtrSetImpl<MachineInstr *> &CopyForDef);
 
+  /// Check if partial subreg writes to this register are safe to convert to
+  /// AGPR.  Returns false if there are unsafe partial redef patterns.
+  bool hasSafePartialRedefs(Register Reg);
+
+  void revertRewrite(
+      const std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands);
+
   /// Calculate the rewrite cost and undo the state change (e.g. rewriting) done
   /// in initHeuristics. Uses \p CopyForUse and \p CopyForDef to calculate copy
   /// costs, and \p RewriteCands to undo rewriting.

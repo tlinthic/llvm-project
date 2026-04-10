@@ -137,6 +137,7 @@ add_llvm_target(AMDGPUCodeGen
   GCNRewritePartialRegUses.cpp
   GCNSchedStrategy.cpp
   GCNSubtarget.cpp
+  splitting_rewrite/SplittingRewrite.cpp
   GCNVOPDUtils.cpp
   R600AsmPrinter.cpp
   R600ClauseMergePass.cpp

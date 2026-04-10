@@ -29,6 +29,7 @@
 #include "GCNRegPressure.h"
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "splitting_rewrite/SplittingRewrite.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
@@ -76,6 +77,11 @@ static cl::opt<bool> GCNTrackers(
     "amdgpu-use-amdgpu-trackers", cl::Hidden,
     cl::desc("Use the AMDGPU specific RPTrackers during scheduling"),
     cl::init(false));
+
+static cl::opt<bool> UseSplittingRewrite(
+    "amdgpu-use-splitting-rewrite", cl::Hidden,
+    cl::desc("Use live range partitioning for MFMA rewrite (default)"),
+    cl::init(true));
 
 static cl::opt<unsigned> PendingQueueLimit(
     "amdgpu-scheduler-pending-queue-limit", cl::Hidden,
@@ -1375,6 +1381,21 @@ bool RewriteMFMAFormStage::initGCNSchedStage() {
   // may result in less cross RC copies.
   if (Cost > 0)
     return false;
+
+  // Choose between original and splitting-based rewrite
+  if (UseSplittingRewrite) {
+    LLVM_DEBUG(dbgs() << "Using live range partitioning rewrite\n");
+    if (!rewriteWithPartitioning(RewriteCands, MF, DAG.LIS, TII, SRI, TII))
+      return false;
+
+    // Update region live-ins after reanalysis
+    RegionPressureMap LiveInUpdater(&DAG, false);
+    LiveInUpdater.buildLiveRegMap();
+    for (unsigned Region = 0; Region < DAG.Regions.size(); Region++)
+      DAG.LiveIns[Region] = LiveInUpdater.getLiveRegsForRegionIdx(Region);
+
+    return true;
+  }
 
   return rewrite(RewriteCands);
 }

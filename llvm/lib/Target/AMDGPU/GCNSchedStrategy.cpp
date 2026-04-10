@@ -2588,8 +2588,10 @@ bool RewriteMFMAFormStage::rewrite(
     if (Src2->isReg()) {
       unsigned Src2SubIdx = Src2->getSubReg();
       Register Src2Reg = Src2->getReg();
-      if (!Src2Reg.isVirtual())
+      if (!Src2Reg.isVirtual()) {
+        revertRewrite(RewriteCands);
         return false;
+      }
 
       Register MappedReg = Src2->getReg();
       SmallVector<SlotIndex, 8> Src2ReachingDefs;
@@ -2660,8 +2662,10 @@ bool RewriteMFMAFormStage::rewrite(
 
     MachineOperand *Dst = &MI->getOperand(0);
     Register DstReg = Dst->getReg();
-    if (!DstReg.isVirtual())
+    if (!DstReg.isVirtual()) {
+      revertRewrite(RewriteCands);
       return false;
+    }
 
     unsigned DstRegSubIdx = Dst->getSubReg();
     Register MappedReg = DstReg;

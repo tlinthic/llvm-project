@@ -54,7 +54,13 @@ struct LiveRangePartition {
   Register getRegForVNI(const VNInfo *VNI) const {
     auto It = IsAGPR.find(VNI);
     assert(It != IsAGPR.end() && "VNI not in partition");
-    return It->second ? AGPRReg : VGPRReg;
+    if (It->second) {
+      assert(AGPRReg.isValid() &&
+             "AGPR partition requested but no AGPR register created");
+      return AGPRReg;
+    } else {
+      return VGPRReg;
+    }
   }
 };
 
@@ -90,8 +96,14 @@ struct ConnectionPoint {
 LLVM_DUMP_METHOD void dumpPartition(const LiveRangePartition &Partition,
                                     const TargetRegisterInfo *TRI) {
   dbgs() << "Partition of " << printReg(Partition.OrigReg, TRI) << ":\n";
-  dbgs() << "  AGPR reg: " << printReg(Partition.AGPRReg, TRI) << "\n";
-  dbgs() << "  VGPR reg: " << printReg(Partition.VGPRReg, TRI) << "\n";
+  dbgs() << "  VGPR reg: " << printReg(Partition.VGPRReg, TRI)
+         << (Partition.VGPRReg == Partition.OrigReg ? " (original reused)" : "")
+         << "\n";
+  if (Partition.AGPRReg.isValid()) {
+    dbgs() << "  AGPR reg: " << printReg(Partition.AGPRReg, TRI) << "\n";
+  } else {
+    dbgs() << "  AGPR reg: (none - VGPR only)\n";
+  }
   dbgs() << "  AGPR VNIs: ";
   for (const auto &[VNI, IsAGPR] : Partition.IsAGPR) {
     if (IsAGPR)
@@ -130,41 +142,38 @@ static bool hasPHIDef(Register Reg, LiveIntervals *LIS) {
   return false;
 }
 
+// Forward declaration
+static void findReachingDefs(const VNInfo *VNI, const LiveInterval &LI,
+                             LiveIntervals *LIS,
+                             SmallVectorImpl<SlotIndex> &DefIdxs);
+
 /// Classify a VNInfo as AGPR or VGPR based on its defining instruction.
-/// Phase 3: Now handles PHI nodes by analyzing uses.
+/// For PHI nodes, classify based on incoming values (reaching defs).
 static bool classifyVNInfo(const VNInfo *VNI, LiveIntervals *LIS,
                            const TargetInstrInfo *TII, bool DefIsAGPR,
                            Register Reg, MachineRegisterInfo &MRI) {
   if (VNI->isPHIDef()) {
-    // Phase 3: Classify PHI based on uses.
-    // If all uses are AGPR (MFMA), classify as AGPR.
-    // If all uses are VGPR (non-MFMA), classify as VGPR.
-    // If mixed, classify as VGPR (conservative - copies will be inserted).
+    // Classify PHI based on its incoming values (reaching defs).
+    // A PHI should be AGPR if ANY of its incoming values is defined by an MFMA.
+    // This handles loop exit PHIs correctly - if the loop produces AGPR values,
+    // the exit PHI should also be AGPR.
 
-    bool HasAGPRUse = false;
-    bool HasVGPRUse = false;
+    LiveInterval &LI = LIS->getInterval(Reg);
+    SmallVector<SlotIndex, 8> ReachingDefIdxs;
+    findReachingDefs(VNI, LI, LIS, ReachingDefIdxs);
 
-    for (MachineOperand &UseMO : MRI.use_operands(Reg)) {
-      MachineInstr *UseMI = UseMO.getParent();
-      SlotIndex UseIdx = LIS->getInstructionIndex(*UseMI);
-
-      // Check if this use is reached by this PHI VNI
-      LiveInterval &LI = LIS->getInterval(Reg);
-      const VNInfo *ReachingVNI = LI.getVNInfoAt(UseIdx);
-      if (ReachingVNI != VNI)
-        continue;
-
-      // Check if use needs AGPR or VGPR
-      bool UseNeedsAGPR = static_cast<const SIInstrInfo *>(TII)->isMAI(*UseMI);
-      if (UseNeedsAGPR)
-        HasAGPRUse = true;
-      else
-        HasVGPRUse = true;
+    bool HasAGPRReachingDef = false;
+    for (SlotIndex RDIdx : ReachingDefIdxs) {
+      MachineInstr *RDInstr = LIS->getInstructionFromIndex(RDIdx);
+      if (RDInstr && static_cast<const SIInstrInfo *>(TII)->isMAI(*RDInstr)) {
+        HasAGPRReachingDef = true;
+        break;
+      }
     }
 
-    // If all uses are AGPR, classify as AGPR
-    // Otherwise, classify as VGPR (conservative)
-    return DefIsAGPR && HasAGPRUse && !HasVGPRUse;
+    // If register is MFMA dst and has AGPR reaching def, classify as AGPR.
+    // Otherwise VGPR (conservative - copies will be inserted at PHI boundaries).
+    return DefIsAGPR && HasAGPRReachingDef;
   }
 
   MachineInstr *DefMI = LIS->getInstructionFromIndex(VNI->def);
@@ -174,11 +183,12 @@ static bool classifyVNInfo(const VNInfo *VNI, LiveIntervals *LIS,
     return false;
   }
 
-  // For MFMA results (DefIsAGPR=true), the def is AGPR if it's an MFMA
-  // For MFMA operands (DefIsAGPR=false), the def is AGPR only if it's an MFMA
+  // MFMA instructions always produce AGPR values (in their dst operand).
+  // So any VNInfo whose def is an MFMA should be classified as AGPR,
+  // regardless of whether this register is used as MFMA dst or src2.
   bool IsMFMADef = static_cast<const SIInstrInfo *>(TII)->isMAI(*DefMI);
 
-  return DefIsAGPR ? IsMFMADef : false;
+  return IsMFMADef;
 }
 
 /// Deduplicate connection points.
@@ -186,6 +196,60 @@ static void
 deduplicateConnectionPoints(SmallVectorImpl<ConnectionPoint> &Points) {
   llvm::sort(Points);
   Points.erase(llvm::unique(Points), Points.end());
+}
+
+/// Find all non-PHI reaching defs for a given VNInfo.
+/// If the VNInfo is not a PHI, returns just that def.
+/// If the VNInfo is a PHI, traverses backward to find all non-PHI defs.
+static void findReachingDefs(const VNInfo *VNI, const LiveInterval &LI,
+                             LiveIntervals *LIS,
+                             SmallVectorImpl<SlotIndex> &DefIdxs) {
+  LLVM_DEBUG(dbgs() << "  findReachingDefs: VNI " << VNI->id << " @ "
+                    << VNI->def << " isPHI=" << VNI->isPHIDef() << "\n");
+
+  // If the def is not a PHI, then it must be the only reaching def.
+  if (!VNI->isPHIDef()) {
+    DefIdxs.push_back(VNI->def);
+    LLVM_DEBUG(dbgs() << "    -> Non-PHI, single def at " << VNI->def << "\n");
+    return;
+  }
+
+  LLVM_DEBUG(dbgs() << "    -> PHI def, traversing backward...\n");
+
+  MachineBasicBlock *PhiMBB = LIS->getMBBFromIndex(VNI->def);
+  SmallPtrSet<MachineBasicBlock *, 8> Visited = {PhiMBB};
+  SmallVector<MachineBasicBlock *, 8> Worklist;
+
+  // Mark the predecessor blocks for traversal
+  for (MachineBasicBlock *PredMBB : PhiMBB->predecessors()) {
+    Worklist.push_back(PredMBB);
+    Visited.insert(PredMBB);
+  }
+
+  while (!Worklist.empty()) {
+    MachineBasicBlock *CurrMBB = Worklist.pop_back_val();
+
+    SlotIndex CurrMBBEnd = LIS->getMBBEndIdx(CurrMBB);
+    const VNInfo *CurrVNI = LI.getVNInfoAt(CurrMBBEnd.getPrevSlot());
+
+    if (!CurrVNI)
+      continue;
+
+    MachineBasicBlock *DefMBB = LIS->getMBBFromIndex(CurrVNI->def);
+
+    // If there is a def in this block, then add it to the list. This is the
+    // reaching def of this path.
+    if (!CurrVNI->isPHIDef()) {
+      DefIdxs.push_back(CurrVNI->def);
+      LLVM_DEBUG(dbgs() << "      Found reaching def at " << CurrVNI->def << "\n");
+      continue;
+    }
+
+    for (MachineBasicBlock *PredMBB : DefMBB->predecessors()) {
+      if (Visited.insert(PredMBB).second)
+        Worklist.push_back(PredMBB);
+    }
+  }
 }
 
 /// Optimize copy placement by grouping copies in the same block.
@@ -278,80 +342,81 @@ partitionLiveRange(Register Reg, bool DefIsAGPR, LiveIntervals *LIS,
                       << (VNI->isPHIDef() ? " (PHI)" : "") << "\n");
   }
 
-  // Check if partitioning is actually needed by examining uses.
-  // If all uses match their reaching def's register class, no partition needed.
-  bool NeedsPartition = false;
+  // Check if partitioning is needed: do we have BOTH AGPR and VGPR uses,
+  // OR both AGPR and VGPR defs? If so, we need to split into two registers.
+  bool HasAGPRUse = false;
+  bool HasVGPRUse = false;
+  unsigned AGPRUseCount = 0;
+  unsigned VGPRUseCount = 0;
   for (MachineOperand &UseMO : MRI.use_operands(Reg)) {
     MachineInstr *UseMI = UseMO.getParent();
-    SlotIndex UseIdx = LIS->getInstructionIndex(*UseMI);
-    const VNInfo *ReachingVNI = LI.getVNInfoAt(UseIdx);
-
-    if (!ReachingVNI)
-      continue;
-
     bool UseNeedsAGPR = static_cast<const SIInstrInfo *>(TII)->isMAI(*UseMI);
-    bool DefIsAGPR = VNIClassification[ReachingVNI];
-
-    if (UseNeedsAGPR != DefIsAGPR) {
-      NeedsPartition = true;
-      break;
+    if (UseNeedsAGPR) {
+      HasAGPRUse = true;
+      AGPRUseCount++;
+    } else {
+      HasVGPRUse = true;
+      VGPRUseCount++;
     }
+    LLVM_DEBUG(dbgs() << "    Use in " << UseMI->getOpcode() << " ("
+                      << (UseNeedsAGPR ? "AGPR" : "VGPR") << ")\n");
+  }
+  LLVM_DEBUG(dbgs() << "  Total uses: " << AGPRUseCount << " AGPR, "
+                    << VGPRUseCount << " VGPR\n");
+
+  bool HasAGPRDef = false;
+  bool HasVGPRDef = false;
+  for (auto &[VNI, IsAGPR] : VNIClassification) {
+    if (IsAGPR)
+      HasAGPRDef = true;
+    else
+      HasVGPRDef = true;
   }
 
+  // Partition needed if AGPR defs reach VGPR uses OR VGPR defs reach AGPR uses
+  bool NeedsPartition = (HasAGPRDef && HasVGPRUse) || (HasVGPRDef && HasAGPRUse);
+
+  LLVM_DEBUG(dbgs() << "  Partition decision: HasAGPRDef=" << HasAGPRDef
+                    << ", HasVGPRDef=" << HasVGPRDef
+                    << ", HasAGPRUse=" << HasAGPRUse
+                    << ", HasVGPRUse=" << HasVGPRUse
+                    << " -> NeedsPartition=" << NeedsPartition << "\n");
+
   if (!NeedsPartition) {
-    LLVM_DEBUG(dbgs() << "  No partition needed - all uses match defs\n");
-
-    // Special case: If DefIsAGPR=true (MFMA dst) and all uses are AGPR,
-    // we still need to create the AGPR register because the original
-    // register class might be VGPR. We can skip creating VGPRReg though.
-    // Similarly, if DefIsAGPR=false (src2) and all uses/defs are VGPR,
-    // no partition needed at all.
-
-    // Check if we need to create single-class "partition" (AGPR-only).
-    bool AllAGPR = true;
-    bool AllVGPR = true;
-    for (auto &[VNI, IsAGPR] : VNIClassification) {
-      if (IsAGPR)
-        AllVGPR = false;
-      else
-        AllAGPR = false;
-    }
-
-    if (AllAGPR && DefIsAGPR) {
-      // MFMA dst with all AGPR uses - create AGPR-only partition.
-      const TargetRegisterClass *OrigRC = MRI.getRegClass(Reg);
-      const TargetRegisterClass *AGPRRC =
-          static_cast<const SIRegisterInfo *>(TRI)->getEquivalentAGPRClass(
-              OrigRC);
-
-      Register AGPRReg = MRI.createVirtualRegister(AGPRRC);
-      LiveRangePartition Partition(Reg, AGPRReg, AGPRReg); // Use same for both
-      Partition.IsAGPR = std::move(VNIClassification);
-
-      LLVM_DEBUG(dbgs() << "  AGPR-only partition created\n");
-      return Partition;
-    }
-
-    // Otherwise, truly no partition needed.
+    LLVM_DEBUG(dbgs() << "  No partition needed - will handle with simple "
+                         "register class conversion\n");
+    // No partition needed. Simple register class conversion will suffice.
+    // Copy insertion will happen naturally at VGPR/AGPR boundaries.
     return std::nullopt;
   }
 
-  // Create new registers for each partition.
+  // Partitioning is needed. Strategy: always reuse original as VGPR (matching
+  // old implementation). Only create AGPR temp if we have AGPR uses.
   const TargetRegisterClass *OrigRC = MRI.getRegClass(Reg);
   const TargetRegisterClass *AGPRRC =
       static_cast<const SIRegisterInfo *>(TRI)->getEquivalentAGPRClass(OrigRC);
-  const TargetRegisterClass *VGPRRC =
-      static_cast<const SIRegisterInfo *>(TRI)->getEquivalentVGPRClass(OrigRC);
 
-  Register AGPRReg = MRI.createVirtualRegister(AGPRRC);
-  Register VGPRReg = MRI.createVirtualRegister(VGPRRC);
+  // Always reuse original as VGPR.
+  Register VGPRReg = Reg;
+
+  // Create AGPR register if there are any AGPR defs or AGPR uses.
+  // We need the AGPR partition to connect VGPR↔AGPR via copies.
+  Register AGPRReg;
+  if (HasAGPRDef || HasAGPRUse) {
+    AGPRReg = MRI.createVirtualRegister(AGPRRC);
+    LLVM_DEBUG(dbgs() << "  Reusing original as VGPR, created AGPR temp: "
+                      << printReg(AGPRReg, TRI) << "\n");
+  } else {
+    LLVM_DEBUG(dbgs() << "  Reusing original as VGPR, no AGPR temp needed\n");
+  }
 
   LiveRangePartition Partition(Reg, AGPRReg, VGPRReg);
   Partition.IsAGPR = std::move(VNIClassification);
 
   LLVM_DEBUG(dumpPartition(Partition, TRI));
-  LLVM_DEBUG(dbgs() << "  Partition created with " << MRI.getNumVirtRegs() - 2
-                    << " -> " << MRI.getNumVirtRegs() << " virtual registers\n");
+  unsigned NewVirtRegs = AGPRReg.isValid() ? 1 : 0;
+  LLVM_DEBUG(dbgs() << "  Partition created, new virtual registers: "
+                    << NewVirtRegs << "\n");
 
   return Partition;
 }
@@ -396,47 +461,133 @@ findConnectionPoints(const LiveRangePartition &Partition, bool CopyNearDef,
     assert(It != Partition.IsAGPR.end() && "VNI not in partition");
     bool DefIsAGPR = It->second;
 
-    LLVM_DEBUG(dbgs() << "  Use at " << UseIdx << " in " << UseMI->getOpcode()
-                      << ": needs " << (UseNeedsAGPR ? "AGPR" : "VGPR")
+    LLVM_DEBUG(dbgs() << "  Use at " << UseIdx << " in "
+                      << UseMI->getOpcode() << " (";
+               UseMI->print(dbgs(), /*IsStandalone=*/false,
+                            /*SkipOpers=*/true, /*SkipDebugLoc=*/true,
+                            /*AddNewLine=*/false);
+               dbgs() << "): needs " << (UseNeedsAGPR ? "AGPR" : "VGPR")
                       << ", reached by " << (DefIsAGPR ? "AGPR" : "VGPR")
-                      << " VNI " << ReachingVNI->id << "\n");
+                      << " VNI " << ReachingVNI->id << " @ " << ReachingVNI->def
+                      << "\n");
 
     if (UseNeedsAGPR != DefIsAGPR) {
       // Connection point detected!
-      MachineInstr *DefMI = LIS->getInstructionFromIndex(ReachingVNI->def);
-
-      SlotIndex Location;
-      MachineInstr *InsertNear;
-      bool IsDefSide;
-
+      LLVM_DEBUG(dbgs() << "  ★ CONNECTION POINT DETECTED at " << UseIdx << "\n");
       if (UseNeedsAGPR && !DefIsAGPR) {
         // VGPR→AGPR: place near def if requested.
-        if (CopyNearDef && DefMI) {
-          Location = ReachingVNI->def;
-          InsertNear = DefMI;
-          IsDefSide = true;
+        assert(Partition.AGPRReg.isValid() &&
+               "VGPR→AGPR copy but no AGPR register");
+
+        LLVM_DEBUG(dbgs() << "  VGPR→AGPR copy needed, CopyNearDef="
+                          << CopyNearDef << "\n");
+
+        if (CopyNearDef) {
+          // Find all non-PHI reaching defs.
+          SmallVector<SlotIndex, 8> ReachingDefIdxs;
+          findReachingDefs(ReachingVNI, OrigLI, LIS, ReachingDefIdxs);
+
+          LLVM_DEBUG(dbgs() << "  Found " << ReachingDefIdxs.size()
+                            << " reaching defs\n");
+
+          // Insert a copy after each reaching def, but only for VGPR defs.
+          // MFMA defs are already in AGPR partition and don't need VGPR→AGPR copies.
+          for (SlotIndex RDIdx : ReachingDefIdxs) {
+            // Check if this reaching def is in the VGPR partition.
+            const VNInfo *RDVNI = OrigLI.getVNInfoAt(RDIdx);
+            if (!RDVNI) {
+              LLVM_DEBUG(dbgs() << "  -> No VNInfo at reaching def " << RDIdx
+                                << "\n");
+              continue;
+            }
+
+            MachineInstr *RDInstr = LIS->getInstructionFromIndex(RDIdx);
+            bool IsMAI = RDInstr && static_cast<const SIInstrInfo *>(TII)->isMAI(*RDInstr);
+
+            auto RDIt = Partition.IsAGPR.find(RDVNI);
+            if (RDIt == Partition.IsAGPR.end()) {
+              LLVM_DEBUG(dbgs() << "  -> VNI " << RDVNI->id << " @ " << RDIdx
+                                << " not found in partition map\n");
+              continue;
+            }
+
+            // Skip AGPR defs (e.g., MFMA defs) - they don't need VGPR→AGPR copies.
+            if (RDIt->second) {
+              LLVM_DEBUG(dbgs() << "  -> Skipping AGPR reaching def VNI "
+                                << RDVNI->id << " @ " << RDIdx
+                                << " (already in AGPR partition, isMAI=" << IsMAI << ")\n");
+              continue;
+            }
+
+            LLVM_DEBUG(dbgs() << "  -> VGPR reaching def VNI " << RDVNI->id
+                              << " @ " << RDIdx << " needs copy (isMAI=" << IsMAI << ")\n");
+
+            MachineInstr *RD = LIS->getInstructionFromIndex(RDIdx);
+            if (RD) {
+              Points.emplace_back(RDIdx, Partition.VGPRReg, Partition.AGPRReg,
+                                  /*IsDefSide=*/true, RD);
+              LLVM_DEBUG(dbgs() << "  -> VGPR→AGPR copy needed after reaching def at "
+                                << RDIdx << "\n");
+            }
+          }
+
+          // If no reaching defs found, fall back to placing near use.
+          if (ReachingDefIdxs.empty()) {
+            Points.emplace_back(UseIdx, Partition.VGPRReg, Partition.AGPRReg,
+                                /*IsDefSide=*/false, UseMI);
+            LLVM_DEBUG(dbgs() << "  -> VGPR→AGPR copy needed at use " << UseIdx
+                              << " (no reaching defs found)\n");
+          }
         } else {
-          Location = UseIdx;
-          InsertNear = UseMI;
-          IsDefSide = false;
+          // CopyNearDef=false: place near use.
+          Points.emplace_back(UseIdx, Partition.VGPRReg, Partition.AGPRReg,
+                              /*IsDefSide=*/false, UseMI);
+          LLVM_DEBUG(dbgs() << "  -> VGPR→AGPR copy needed at " << UseIdx
+                            << "\n");
         }
 
-        Points.emplace_back(Location, Partition.VGPRReg, Partition.AGPRReg,
-                            IsDefSide, InsertNear);
-
-        LLVM_DEBUG(dbgs() << "  -> VGPR→AGPR copy needed at " << Location
-                          << "\n");
+        // Copies were added in the loop above or as fallback
       } else {
         // AGPR→VGPR: place near use.
-        Location = UseIdx;
-        InsertNear = UseMI;
-        IsDefSide = false;
+        assert(Partition.VGPRReg.isValid() &&
+               "AGPR→VGPR copy but no VGPR register");
 
-        Points.emplace_back(Location, Partition.AGPRReg, Partition.VGPRReg,
-                            IsDefSide, InsertNear);
+        LLVM_DEBUG(dbgs() << "  ★★★ AGPR→VGPR copy needed at " << UseIdx
+                          << " (this is what we're missing!)\n");
 
-        LLVM_DEBUG(dbgs() << "  -> AGPR→VGPR copy needed at " << Location
-                          << "\n");
+        Points.emplace_back(UseIdx, Partition.AGPRReg, Partition.VGPRReg,
+                            /*IsDefSide=*/false, UseMI);
+
+        LLVM_DEBUG(dbgs() << "  -> AGPR→VGPR copy added to connection points\n");
+      }
+    }
+  }
+
+  // Handle AGPR PHIs with VGPR reaching defs - need VGPR→AGPR copies on those edges
+  for (const auto &[VNI, IsAGPR] : Partition.IsAGPR) {
+    if (!VNI || !VNI->isPHIDef() || !IsAGPR)
+      continue;
+
+    SmallVector<SlotIndex, 8> ReachingDefIdxs;
+    findReachingDefs(VNI, OrigLI, LIS, ReachingDefIdxs);
+
+    for (SlotIndex RDIdx : ReachingDefIdxs) {
+      const VNInfo *RDVNI = OrigLI.getVNInfoAt(RDIdx);
+      if (!RDVNI)
+        continue;
+
+      auto RDIt = Partition.IsAGPR.find(RDVNI);
+      if (RDIt == Partition.IsAGPR.end())
+        continue;
+
+      // If reaching def is VGPR but PHI is AGPR, need VGPR→AGPR copy
+      if (!RDIt->second) {
+        MachineInstr *RD = LIS->getInstructionFromIndex(RDIdx);
+        if (!RD)
+          continue;
+
+        Points.emplace_back(RDIdx, Partition.VGPRReg, Partition.AGPRReg,
+                            /*IsDefSide=*/true, RD);
       }
     }
   }
@@ -487,33 +638,26 @@ static void insertCopies(ArrayRef<ConnectionPoint> Points, LiveIntervals *LIS,
   }
 }
 
-/// Collect all uses and defs of a register BEFORE any copies are inserted.
-/// Returns pair of (uses, defs).
-static std::pair<SmallVector<MachineOperand *, 8>,
-                 SmallVector<MachineOperand *, 8>>
-collectOperands(Register Reg, MachineRegisterInfo &MRI) {
+/// Collect all uses of a register BEFORE any copies are inserted.
+static SmallVector<MachineOperand *, 8>
+collectUses(Register Reg, MachineRegisterInfo &MRI) {
   SmallVector<MachineOperand *, 8> Uses;
-  SmallVector<MachineOperand *, 8> Defs;
 
   for (MachineOperand &UseMO : MRI.use_operands(Reg))
     Uses.push_back(&UseMO);
 
-  for (MachineOperand &DefMO : MRI.def_operands(Reg))
-    Defs.push_back(&DefMO);
-
-  return {Uses, Defs};
+  return Uses;
 }
 
-/// Update the collected uses and defs to use the appropriate partition
-/// register. For MFMA instructions (which have been rewritten to AGPR form),
+/// Update the collected uses to use the appropriate partition register.
+/// For MFMA instructions (which have been rewritten to AGPR form),
 /// always use AGPR. For non-MFMA instructions, use VGPR.
-static void updateOperands(const LiveRangePartition &Partition,
-                           ArrayRef<MachineOperand *> Uses,
-                           ArrayRef<MachineOperand *> Defs,
-                           MachineRegisterInfo &MRI,
-                           const TargetInstrInfo *TII) {
+static void updateUses(const LiveRangePartition &Partition,
+                       ArrayRef<MachineOperand *> Uses,
+                       MachineRegisterInfo &MRI,
+                       const TargetInstrInfo *TII) {
 
-  LLVM_DEBUG(dbgs() << "Updating operands for "
+  LLVM_DEBUG(dbgs() << "Updating uses for "
                     << printReg(Partition.OrigReg, MRI.getTargetRegisterInfo())
                     << "\n");
 
@@ -523,7 +667,14 @@ static void updateOperands(const LiveRangePartition &Partition,
 
     // MFMA instructions (already rewritten to AGPR form) need AGPR
     bool UseNeedsAGPR = static_cast<const SIInstrInfo *>(TII)->isMAI(*UseMI);
-    Register NewReg = UseNeedsAGPR ? Partition.AGPRReg : Partition.VGPRReg;
+    Register NewReg;
+    if (UseNeedsAGPR) {
+      assert(Partition.AGPRReg.isValid() &&
+             "AGPR use but no AGPR register created");
+      NewReg = Partition.AGPRReg;
+    } else {
+      NewReg = Partition.VGPRReg;
+    }
 
     UseMO->setReg(NewReg);
 
@@ -531,20 +682,66 @@ static void updateOperands(const LiveRangePartition &Partition,
                       << " -> " << printReg(NewReg, MRI.getTargetRegisterInfo())
                       << "\n");
   }
+}
 
-  // Update all defs.
-  for (MachineOperand *DefMO : Defs) {
-    MachineInstr *DefMI = DefMO->getParent();
+/// Update defs based on VNInfo def points, not raw def operands.
+/// This ensures we only update the "primary" def instruction for each VNInfo,
+/// avoiding duplicate subreg build sequences.
+static void updateDefs(const LiveRangePartition &Partition,
+                       LiveIntervals *LIS,
+                       MachineRegisterInfo &MRI,
+                       const TargetInstrInfo *TII) {
 
-    // MFMA instructions (already rewritten to AGPR form) produce AGPR
-    bool DefIsAGPR = static_cast<const SIInstrInfo *>(TII)->isMAI(*DefMI);
-    Register NewReg = DefIsAGPR ? Partition.AGPRReg : Partition.VGPRReg;
+  LLVM_DEBUG(dbgs() << "Updating defs for "
+                    << printReg(Partition.OrigReg, MRI.getTargetRegisterInfo())
+                    << "\n");
 
-    DefMO->setReg(NewReg);
+  LiveInterval &LI = LIS->getInterval(Partition.OrigReg);
 
-    LLVM_DEBUG(dbgs() << "  Def in " << (DefIsAGPR ? "MFMA" : "non-MFMA")
-                      << " -> " << printReg(NewReg, MRI.getTargetRegisterInfo())
-                      << "\n");
+  // Iterate over each VNInfo and update the def at its def point
+  for (VNInfo *VNI : LI.valnos) {
+    if (!VNI)
+      continue;
+
+    // Skip PHI defs - they don't have a defining instruction
+    if (VNI->isPHIDef()) {
+      LLVM_DEBUG(dbgs() << "  VNI " << VNI->id << " is PHI, skipping\n");
+      continue;
+    }
+
+    MachineInstr *DefMI = LIS->getInstructionFromIndex(VNI->def);
+    if (!DefMI) {
+      LLVM_DEBUG(dbgs() << "  VNI " << VNI->id << " has no def instruction\n");
+      continue;
+    }
+
+    // Determine which partition this VNI belongs to
+    auto It = Partition.IsAGPR.find(VNI);
+    if (It == Partition.IsAGPR.end()) {
+      LLVM_DEBUG(dbgs() << "  VNI " << VNI->id << " not in partition map\n");
+      continue;
+    }
+
+    bool DefIsAGPR = It->second;
+    Register NewReg;
+    if (DefIsAGPR) {
+      assert(Partition.AGPRReg.isValid() &&
+             "AGPR def but no AGPR register created");
+      NewReg = Partition.AGPRReg;
+    } else {
+      NewReg = Partition.VGPRReg;
+    }
+
+    // Update all defs of OrigReg in this instruction to use NewReg
+    for (MachineOperand &MO : DefMI->operands()) {
+      if (MO.isReg() && MO.isDef() && MO.getReg() == Partition.OrigReg) {
+        MO.setReg(NewReg);
+        LLVM_DEBUG(dbgs() << "  Updated def in VNI " << VNI->id << " @ "
+                          << VNI->def << " to "
+                          << printReg(NewReg, MRI.getTargetRegisterInfo())
+                          << "\n");
+      }
+    }
   }
 }
 
@@ -575,13 +772,16 @@ bool rewriteWithPartitioning(
   LLVM_DEBUG(dbgs() << "Function: " << MF.getName() << "\n");
   LLVM_DEBUG(dbgs() << "Processing " << RewriteCands.size() << " candidates\n");
 
-  // Step 1: Identify all unique registers to partition and collect their
-  // operands.
+  // Step 1: Collect all unique registers that participate in MFMAs.
+  // Track the roles each register plays using flags.
+  enum RegRole : unsigned {
+    MFMA_DST  = 1 << 0,  // Register is defined by MFMA (destination operand)
+    MFMA_SRC2 = 1 << 1,  // Register is used as src2 in MFMA (accumulator input)
+  };
+
   struct RegInfo {
-    bool IsAGPRDef; // true if register is defined by MFMA (dst), false if used.
-                    // (src2)
+    unsigned Roles = 0;  // Bitmask of RegRole flags
     SmallVector<MachineOperand *, 8> Uses;
-    SmallVector<MachineOperand *, 8> Defs;
   };
   DenseMap<Register, RegInfo> RegistersToPartition;
 
@@ -590,23 +790,28 @@ bool rewriteWithPartitioning(
     if (ReplacementOp == -1)
       continue;
 
-    // Track dst register.
+    // Track dst register - mark as MFMA_DST.
+    // A register can be both dst and src2 (accumulator chains), so we OR the flags.
     Register DstReg = MI->getOperand(0).getReg();
     if (DstReg.isVirtual()) {
-      if (!RegistersToPartition.count(DstReg)) {
-        auto [Uses, Defs] = collectOperands(DstReg, MRI);
-        RegistersToPartition[DstReg] = {/*IsAGPRDef=*/true, Uses, Defs};
+      auto &Info = RegistersToPartition[DstReg];
+      Info.Roles |= MFMA_DST;
+      if (Info.Uses.empty()) {
+        // First time seeing this register - collect its uses.
+        Info.Uses = collectUses(DstReg, MRI);
       }
     }
 
-    // Track src2 register.
+    // Track src2 register - mark as MFMA_SRC2.
     MachineOperand *Src2 = SII->getNamedOperand(*MI, AMDGPU::OpName::src2);
     if (Src2 && Src2->isReg()) {
       Register Src2Reg = Src2->getReg();
       if (Src2Reg.isVirtual()) {
-        if (!RegistersToPartition.count(Src2Reg)) {
-          auto [Uses, Defs] = collectOperands(Src2Reg, MRI);
-          RegistersToPartition[Src2Reg] = {/*IsAGPRDef=*/false, Uses, Defs};
+        auto &Info = RegistersToPartition[Src2Reg];
+        Info.Roles |= MFMA_SRC2;
+        if (Info.Uses.empty()) {
+          // First time seeing this register - collect its uses.
+          Info.Uses = collectUses(Src2Reg, MRI);
         }
       }
     }
@@ -615,13 +820,28 @@ bool rewriteWithPartitioning(
   // Step 2: Partition each unique register once.
   DenseMap<Register, LiveRangePartition> Partitions;
   for (auto &[Reg, Info] : RegistersToPartition) {
-    LLVM_DEBUG(dbgs() << "\nPartitioning " << printReg(Reg, TRI)
-                      << (Info.IsAGPRDef ? " (AGPR def)" : " (VGPR def)")
-                      << "\n");
+    // Determine partitioning mode based on roles:
+    // - If register is MFMA dst (even if also src2), classify as AGPR def.
+    //   This handles accumulator chains correctly - the MFMA-defined values
+    //   are AGPR, and we'll insert VGPR→AGPR copies for non-MFMA reaching defs.
+    // - If register is only MFMA src2 (not dst), classify as VGPR def.
+    bool DefIsAGPR = (Info.Roles & MFMA_DST) != 0;
+
+    LLVM_DEBUG({
+      dbgs() << "\nPartitioning " << printReg(Reg, TRI) << " (";
+      if (Info.Roles & MFMA_DST) dbgs() << "MFMA_DST ";
+      if (Info.Roles & MFMA_SRC2) dbgs() << "MFMA_SRC2";
+      dbgs() << ")\n";
+    });
+
     auto Partition =
-        partitionLiveRange(Reg, Info.IsAGPRDef, LIS, MRI, TII, TRI);
+        partitionLiveRange(Reg, DefIsAGPR, LIS, MRI, TII, TRI);
     if (Partition) {
       Partitions[Reg] = *Partition;
+      LLVM_DEBUG(dbgs() << "  ✓ Partition created for " << printReg(Reg, TRI) << "\n");
+    } else {
+      LLVM_DEBUG(dbgs() << "  ✗ NO PARTITION created for " << printReg(Reg, TRI)
+                        << " (returned nullopt)\n");
     }
   }
 
@@ -666,7 +886,7 @@ bool rewriteWithPartitioning(
 
     auto DstConnections =
         findConnectionPoints(DstIt->second,
-                             /*CopyNearDef=*/false, LIS, TII, TRI);
+                             /*CopyNearDef=*/true, LIS, TII, TRI);
 
     // Accumulate connection points, don't insert yet.
     AllConnectionPoints.append(DstConnections.begin(), DstConnections.end());
@@ -712,11 +932,71 @@ bool rewriteWithPartitioning(
     }
   }
 
-  // Then, update all operands to use partitioned registers.
+  // For registers that don't need partitioning, just change their class to AGPR.
+  // These are registers with only AGPR uses (or only VGPR uses, which we skip).
+  LLVM_DEBUG(dbgs() << "\n--- Converting non-partitioned registers to AGPR "
+                       "---\n");
+  for (auto &[Reg, Info] : RegistersToPartition) {
+    // Skip if we already created a partition for this register
+    if (Partitions.count(Reg))
+      continue;
+
+    // Check if this register needs AGPR class by examining its uses
+    bool NeedsAGPR = false;
+    for (MachineOperand *UseMO : Info.Uses) {
+      MachineInstr *UseMI = UseMO->getParent();
+      if (static_cast<const SIInstrInfo *>(TII)->isMAI(*UseMI)) {
+        NeedsAGPR = true;
+        break;
+      }
+    }
+
+    // If needs AGPR, convert to AGPR class
+    if (NeedsAGPR) {
+      const TargetRegisterClass *OrigRC = MRI.getRegClass(Reg);
+      const TargetRegisterClass *AGPRRC =
+          static_cast<const SIRegisterInfo *>(TRI)->getEquivalentAGPRClass(
+              OrigRC);
+      MRI.setRegClass(Reg, AGPRRC);
+
+      LLVM_DEBUG(dbgs() << "  Converted " << printReg(Reg, TRI)
+                        << " to AGPR (no partition needed)\n");
+    }
+  }
+
+  // Then, update uses and defs to use partitioned registers.
+  // Uses are updated from the collected list, defs are updated via VNInfo.
   for (auto &[Reg, Partition] : Partitions) {
     auto It = RegistersToPartition.find(Reg);
     if (It != RegistersToPartition.end()) {
-      updateOperands(Partition, It->second.Uses, It->second.Defs, MRI, TII);
+      updateUses(Partition, It->second.Uses, MRI, TII);
+      updateDefs(Partition, LIS, MRI, TII);
+    }
+  }
+
+  // Finally, change the register class of the original registers.
+  // This must be done after all operands have been updated.
+  LLVM_DEBUG(dbgs() << "\n--- Changing register classes ---\n");
+  for (auto &[Reg, Partition] : Partitions) {
+    const TargetRegisterClass *OrigRC = MRI.getRegClass(Reg);
+
+    if (Partition.AGPRReg == Reg) {
+      // Original is used as AGPR - change to AGPR class
+      const TargetRegisterClass *AGPRRC =
+          static_cast<const SIRegisterInfo *>(TRI)->getEquivalentAGPRClass(
+              OrigRC);
+      MRI.setRegClass(Reg, AGPRRC);
+      LLVM_DEBUG(dbgs() << "  Changed " << printReg(Reg, TRI)
+                        << " to AGPR class\n");
+    } else if (Partition.VGPRReg == Reg) {
+      // Original is used as VGPR - it should already be VGPR class,
+      // but ensure it's set correctly
+      const TargetRegisterClass *VGPRRC =
+          static_cast<const SIRegisterInfo *>(TRI)->getEquivalentVGPRClass(
+              OrigRC);
+      MRI.setRegClass(Reg, VGPRRC);
+      LLVM_DEBUG(dbgs() << "  Ensured " << printReg(Reg, TRI)
+                        << " is VGPR class\n");
     }
   }
 
@@ -737,7 +1017,11 @@ bool rewriteWithPartitioning(
              << (Rewritten ? (float)AllConnectionPoints.size() / Rewritten : 0)
              << "\n");
 
-  if (Rewritten > 0) {
+  // If we made any changes (partitions created, register classes converted,
+  // or opcodes changed), we need to reanalyze and return true.
+  bool MadeChanges = Rewritten > 0 || !RewriteCands.empty();
+
+  if (MadeChanges) {
     // Reanalyze all live intervals.
     LLVM_DEBUG(dbgs() << "Reanalyzing LiveIntervals\n");
     LIS->reanalyze(MF);

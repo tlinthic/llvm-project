@@ -1,5 +1,4 @@
-//===- SplittingRewrite.h - Live Range Partitioning MFMA Rewrite -*- C++
-//-*-===//
+//===- GCNPartitionMFMARewrite.h - Partition-based MFMA Rewrite -*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -12,8 +11,8 @@
 ///
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_AMDGPU_SPLITTINGREWRITE_H
-#define LLVM_LIB_TARGET_AMDGPU_SPLITTINGREWRITE_H
+#ifndef LLVM_LIB_TARGET_AMDGPU_GCNPARTITIONMFMAREWRITE_H
+#define LLVM_LIB_TARGET_AMDGPU_GCNPARTITIONMFMAREWRITE_H
 
 #include "llvm/ADT/ArrayRef.h"
 #include <utility>
@@ -53,4 +52,4 @@ bool rewriteWithPartitioning(
 
 } // namespace llvm
 
-#endif // LLVM_LIB_TARGET_AMDGPU_SPLITTINGREWRITE_H
+#endif // LLVM_LIB_TARGET_AMDGPU_GCNPARTITIONMFMAREWRITE_H

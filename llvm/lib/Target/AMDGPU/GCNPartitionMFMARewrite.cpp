@@ -736,14 +736,11 @@ static void updateDefs(const LiveRangePartition &Partition, LiveIntervals *LIS,
     }
 
     bool MFMADefsAreAGPR = It->second;
-    Register NewReg;
-    if (MFMADefsAreAGPR) {
-      assert(Partition.AGPRReg.isValid() &&
-             "AGPR def but no AGPR register created");
-      NewReg = Partition.AGPRReg;
-    } else {
-      NewReg = Partition.VGPRReg;
-    }
+    if (!MFMADefsAreAGPR)
+      continue; // VGPR partition reuses OrigReg, no update needed
+
+    Register NewReg = Partition.AGPRReg;
+    assert(NewReg.isValid() && "AGPR def but no AGPR register created");
 
     // Update all defs of OrigReg in this instruction to use NewReg
     for (MachineOperand &MO : DefMI->operands()) {
